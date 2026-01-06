@@ -29,23 +29,23 @@ void disk_op(int blockno, uint8_t *data, bool write)
 #define SFS_BH_HASH_SIZE (1 << SFS_BH_HASH_SHIFT)
 #define SFS_BH_HASH_MASK (SFS_BH_HASH_SIZE - 1)
 
-// 内存中的缓存块头描述符 (Buffer Head)
+// 缓存块头
 struct buf_head
 {
     uint32_t blockno;      // 块号
     uint8_t *data;         // 指向实际 4KB 数据的指针
-    bool dirty;            // 脏位，是否需要写回磁盘
-    int ref_count;         // 引用计数，为0时可被回收
+    bool dirty;            // 脏位
+    int ref_count;         // 硬链接计数
     struct list_head list; // 用于链接到哈希表中
 };
 
 // 全局 SFS 信息
 static struct sfs_super sfs_sb;     // 超级块缓存
-static uint8_t *sfs_freemap;        // 位图缓存 (需动态分配)
+static uint8_t *sfs_freemap;        // 位图缓存
 static bool sfs_sb_dirty = false;   // 超级块/位图是否脏
-static bool is_sfs_mounted = false; // 是否挂载/初始化
+static bool is_sfs_mounted = false; // 是否已初始化
 
-// 缓存哈希表：blockno -> buf_head
+// 缓存哈希表 blockno -> buf_head
 static struct list_head sfs_bh_hash[SFS_BH_HASH_SIZE];
 
 static void *sfs_alloc(uint32_t size)
@@ -78,12 +78,7 @@ static void sfs_memcpy(void *dst, const void *src, int len)
         *d++ = *s++;
 }
 
-/**
- * 释放一个缓存块的引用
- * 如果引用计数降为0，且没有被钉住(pinned)，在内存紧张时可以回收。
- * 本实验简化处理：引用为0时，如果是脏的，立即写回，并保留在内存中供后续使用，
- * 直到sfs_close或系统退出时统一清理（或者复用）。
- */
+//block release释放
 void brelse(struct buf_head *bh)
 {
     if (!bh)
@@ -97,9 +92,7 @@ void brelse(struct buf_head *bh)
             ;
     }
 
-    // 简单策略：如果脏了且没人用了，可以考虑写回。
-    // 但为了性能，通常只在 cache 满了或者 sync 时写回。
-    // 这里为了数据安全，我们在引用归零时检查是否脏，脏则写回。
+    //引用为零，如果是脏的就要写回，不脏就不用管了
     if (bh->ref_count == 0 && bh->dirty)
     {
         raw_disk_write(bh->blockno, bh->data);
@@ -108,19 +101,13 @@ void brelse(struct buf_head *bh)
     }
 }
 
-/**
- * 获取缓存块
- * 1. 在哈希表中查找
- * 2. 如果没找到，分配新块并从磁盘读取
- * 3. 增加引用计数
- */
+//看blockno是否在缓存中
 struct buf_head *sb_bread(uint32_t blockno)
 {
-    uint32_t hash_idx = bh_hash_fn(blockno);
+    uint32_t hash_idx = bh_hash_fn(blockno); //算哈希
     struct buf_head *bh = NULL;
     struct list_head *pos;
 
-    // 1. 查找缓存
     list_for_each(pos, &sfs_bh_hash[hash_idx])
     {
         struct buf_head *tmp = list_entry(pos, struct buf_head, list);
@@ -131,14 +118,14 @@ struct buf_head *sb_bread(uint32_t blockno)
         }
     }
 
-    // 2. 缓存命中
+    //在缓存中
     if (bh)
     {
         bh->ref_count++;
         return bh;
     }
 
-    // 3. 缓存未命中，创建新块
+    //不在就建一个新块
     bh = (struct buf_head *)sfs_alloc(sizeof(struct buf_head));
     if (!bh)
     {
@@ -154,24 +141,20 @@ struct buf_head *sb_bread(uint32_t blockno)
         return NULL;
     }
 
-    // 读取磁盘数据
+    //把磁盘数据读进内存然后初始化
     raw_disk_read(blockno, bh->data);
-
-    // 初始化元数据
     bh->blockno = blockno;
     bh->dirty = false;
     bh->ref_count = 1;
     INIT_LIST_HEAD(&bh->list);
 
-    // 加入哈希表
+    //加进哈希表
     list_add(&bh->list, &sfs_bh_hash[hash_idx]);
 
     return bh;
 }
 
-/**
- * 标记缓存块为脏
- */
+//标记缓存块脏了
 void mark_buffer_dirty(struct buf_head *bh)
 {
     if (bh)
@@ -187,21 +170,17 @@ int sfs_init()
 
     printf("[SFS] Initializing...\n");
 
-    // 1. 初始化哈希表
+    //初始化哈希表
     for (int i = 0; i < SFS_BH_HASH_SIZE; i++)
-    {
         INIT_LIST_HEAD(&sfs_bh_hash[i]);
-    }
 
-    // 2. 读取超级块 (Block 0)
-    // 我们可以直接读到全局变量 sfs_sb 中，不需要走 buffer cache，
-    // 因为超级块常驻内存且格式固定。
+    //block0
     uint8_t *tmp_buf = (uint8_t *)sfs_alloc(SFS_BLOCK_SIZE);
     raw_disk_read(0, tmp_buf);
     sfs_memcpy(&sfs_sb, tmp_buf, sizeof(struct sfs_super));
-    sfs_free(tmp_buf); // 释放临时buffer
+    sfs_free(tmp_buf);
 
-    // 检查 Magic Number
+    //检查是sfs系统
     if (sfs_sb.magic != SFS_MAGIC)
     {
         printf("[SFS Error] Invalid Magic Number: 0x%x (Expected 0x%x)\n", sfs_sb.magic, SFS_MAGIC);
@@ -209,69 +188,49 @@ int sfs_init()
     }
     printf("[SFS] Magic verified. Blocks: %d, Unused: %d\n", sfs_sb.blocks, sfs_sb.unused_blocks);
 
-    // 3. 读取 Freemap (Block 2 ~ 2 + N)
-    // Freemap 大小计算: sfs_sb.blocks bits.
-    // 需要的字节数: sfs_sb.blocks / 8
-    // 需要的块数: (blocks/8 + 4095) / 4096
-    // 本实验简化处理：假设 Freemap 就在 Block 2，且只有 1 个块 (支持 4096*8 = 32768 blocks，足够大)
-    // 实验指导书提到: "第 2 ～ 2 + freemap 块"
-
-    // 分配内存给 freemap
-    // 假设最大 blocks 数量不会导致 freemap 超过 4096 字节太多，这里先按1个block处理，或者按实际大小动态分配
-    // 为了稳健，我们读取 Freemap 区域的所有块
+    //freemap，都做上取整
     int freemap_bytes = (sfs_sb.blocks + 7) / 8;
     int freemap_blocks = (freemap_bytes + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE;
 
-    // 这里我们只分配必需的大小，或者简单点分配 freemap_blocks * 4096
     sfs_freemap = (uint8_t *)sfs_alloc(freemap_blocks * SFS_BLOCK_SIZE);
 
     for (int i = 0; i < freemap_blocks; i++)
-    {
         raw_disk_read(2 + i, sfs_freemap + i * SFS_BLOCK_SIZE);
-    }
 
     is_sfs_mounted = true;
     printf("[SFS] Mounted successfully.\n");
     return 0;
 }
 
-// 将内存中的 Freemap 写回磁盘 (简化策略：全量写回)
-// 实际生产中只写回变动的 block
+//把freemap写回
 static void sfs_sync_freemap()
 {
     int freemap_bytes = (sfs_sb.blocks + 7) / 8;
     int freemap_blocks = (freemap_bytes + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE;
 
     for (int i = 0; i < freemap_blocks; i++)
-    {
-        // Freemap 从 Block 2 开始
         raw_disk_write(2 + i, sfs_freemap + i * SFS_BLOCK_SIZE);
-    }
 }
 
-// 分配一个新块，返回块号。失败返回 0。
+//分配新块
 static uint32_t sfs_alloc_block()
 {
     uint32_t total_blocks = sfs_sb.blocks;
 
-    // 扫描位图寻找空闲位 (0)
+    //扫freemamp
     for (uint32_t i = 0; i < total_blocks; i++)
     {
         uint32_t byte_idx = i / 8;
         uint32_t bit_idx = i % 8;
 
-        if (!((sfs_freemap[byte_idx] >> bit_idx) & 1))
+        if (!((sfs_freemap[byte_idx] >> bit_idx) & 1))//发现这一位是0，说明空闲
         {
-            // 找到空闲块
-            sfs_freemap[byte_idx] |= (1 << bit_idx);
+            sfs_freemap[byte_idx] |= (1 << bit_idx);//置1
             sfs_sb.unused_blocks--;
 
-            // 标记超级块和位图脏
-            // 这里为了简化，分配时直接同步位图，虽然慢但安全
-            sfs_sync_freemap();
+            sfs_sync_freemap();//把freemap写回，实现同步
 
-            // 可选：清空新块的内容，防止数据泄露
-            // 但我们的 sb_bread 如果读不到会新建并读取旧数据，所以最好清零
+            //通过写保证新块全零
             uint8_t *zero_buf = sfs_alloc(SFS_BLOCK_SIZE);
             sfs_memset(zero_buf, 0, SFS_BLOCK_SIZE);
             raw_disk_write(i, zero_buf);
@@ -284,7 +243,7 @@ static uint32_t sfs_alloc_block()
     return 0;
 }
 
-// 释放一个块
+//释放块
 static void sfs_free_block(uint32_t blockno)
 {
     if (blockno >= sfs_sb.blocks)
@@ -295,7 +254,7 @@ static void sfs_free_block(uint32_t blockno)
 
     if ((sfs_freemap[byte_idx] >> bit_idx) & 1)
     {
-        sfs_freemap[byte_idx] &= ~(1 << bit_idx);
+        sfs_freemap[byte_idx] &= ~(1 << bit_idx);//更新freemap
         sfs_sb.unused_blocks++;
         sfs_sync_freemap();
     }
@@ -307,18 +266,12 @@ static uint32_t sfs_cal_needed_blocks(uint32_t size)
     return (size + SFS_BLOCK_SIZE - 1) / SFS_BLOCK_SIZE;
 }
 
-/**
- * bmap: 逻辑块号映射到物理块号
- * @inode: 操作的 inode (内存副本或指针，这里为了简单直接传指针，注意并发安全)
- * @bn: 逻辑块号 (Logical Block Number, e.g., 0, 1, 2...)
- * @alloc: 如果对应块不存在，是否分配新块
- * * Return: 物理块号，失败返回 0
- */
+//把逻辑块号转换成物理块号
 static uint32_t sfs_bmap(struct sfs_inode *inode, uint32_t bn, bool alloc)
 {
     uint32_t phys_bn;
 
-    // 1. 直接索引 (0 ~ 10)
+    //在直接索引的范围内
     if (bn < SFS_NDIRECT)
     {
         phys_bn = inode->direct[bn];
@@ -333,11 +286,10 @@ static uint32_t sfs_bmap(struct sfs_inode *inode, uint32_t bn, bool alloc)
         return phys_bn;
     }
 
-    // 2. 间接索引
-    // bn 对应的间接索引表中的下标
+    //间接索引
     uint32_t indirect_idx = bn - SFS_NDIRECT;
 
-    // 一个块能存多少个 uint32_t 索引? 4096 / 4 = 1024
+    // 一个块能存多少个索引? 4096 / 4 = 1024
     uint32_t entries_per_block = SFS_BLOCK_SIZE / sizeof(uint32_t);
 
     if (indirect_idx >= entries_per_block)
@@ -346,7 +298,7 @@ static uint32_t sfs_bmap(struct sfs_inode *inode, uint32_t bn, bool alloc)
         return 0;
     }
 
-    // 检查间接索引块本身是否存在
+    //如果还没出现过简介索引块，先分配一个
     if (inode->indirect == 0)
     {
         if (alloc)
@@ -358,12 +310,10 @@ static uint32_t sfs_bmap(struct sfs_inode *inode, uint32_t bn, bool alloc)
             inode->blocks++;
         }
         else
-        {
             return 0;
-        }
     }
 
-    // 读取间接索引块
+    //读间接索引块
     struct buf_head *bh = sb_bread(inode->indirect);
     if (!bh)
         return 0;
@@ -371,27 +321,22 @@ static uint32_t sfs_bmap(struct sfs_inode *inode, uint32_t bn, bool alloc)
     uint32_t *idx_table = (uint32_t *)bh->data;
     phys_bn = idx_table[indirect_idx];
 
-    if (phys_bn == 0 && alloc)
+    if (phys_bn == 0 && alloc)//没有这个块就分配一个
     {
         phys_bn = sfs_alloc_block();
         if (phys_bn)
         {
             idx_table[indirect_idx] = phys_bn;
             inode->blocks++;
-            mark_buffer_dirty(bh); // 标记间接块脏了
+            mark_buffer_dirty(bh);//分配了之后，原来的间接块脏了
         }
     }
 
-    brelse(bh); // 释放间接索引块的缓存引用
+    brelse(bh);//读完及时释放
     return phys_bn;
 }
 
-/**
- * 在目录 inode 中查找名为 name 的文件
- * @dir_inode: 目录的 Inode
- * @name: 文件名
- * * Return: 找到的 Inode 编号，未找到返回 0
- */
+//在目录里找name文件
 static uint32_t sfs_lookup(struct sfs_inode *dir_inode, const char *name)
 {
     if (dir_inode->type != SFS_DIRECTORY)
@@ -403,21 +348,16 @@ static uint32_t sfs_lookup(struct sfs_inode *dir_inode, const char *name)
     uint32_t entries_per_block = SFS_BLOCK_SIZE / sizeof(struct sfs_entry);
     uint32_t total_entries = dir_inode->size / sizeof(struct sfs_entry);
 
-    // 遍历所有逻辑块
-    // dir_inode->blocks 并不是很准，因为它包含间接块本身，
-    // 最好用 size 计算有多少个有效 entry
-
     int processed_entries = 0;
     int logical_blk = 0;
 
+    //遍历
     while (processed_entries < total_entries)
     {
         uint32_t phys_blk = sfs_bmap(dir_inode, logical_blk, false);
         if (phys_blk == 0)
-        {
-            // 理论上 size 还没完，但 map 不到，说明文件系统这块有问题或空洞
+            // 理论上size还没完，但map不到，说明文件系统这里有个洞
             break;
-        }
 
         struct buf_head *bh = sb_bread(phys_blk);
         if (!bh)
@@ -426,7 +366,6 @@ static uint32_t sfs_lookup(struct sfs_inode *dir_inode, const char *name)
         struct sfs_entry *entries = (struct sfs_entry *)bh->data;
         for (int i = 0; i < entries_per_block && processed_entries < total_entries; i++)
         {
-            // 简单的字符串比较
             if (strcmp(entries[i].filename, name) == 0)
             {
                 uint32_t found_ino = entries[i].ino;
@@ -443,36 +382,33 @@ static uint32_t sfs_lookup(struct sfs_inode *dir_inode, const char *name)
     return 0; // Not found
 }
 
-/**
- * 向目录添加一个 entry (name -> ino)
- * 用于创建文件/目录时
- */
+//创建一个entry
 static int sfs_dir_link(struct sfs_inode *dir_inode, const char *name, uint32_t ino)
 {
     if (dir_inode->type != SFS_DIRECTORY)
         return -1;
 
-    // 检查是否重名 (可选，但在 open 中通常已做)
+    //检查重名
     if (sfs_lookup(dir_inode, name) != 0)
-        return -1; // 已存在
+        return -1;
 
     uint32_t total_entries = dir_inode->size / sizeof(struct sfs_entry);
     uint32_t logical_blk = total_entries * sizeof(struct sfs_entry) / SFS_BLOCK_SIZE;
     uint32_t offset_in_blk = (total_entries * sizeof(struct sfs_entry)) % SFS_BLOCK_SIZE;
 
-    // 获取(或分配)目录数据的最后一块
+    //目录数据的最后一块
     uint32_t phys_blk = sfs_bmap(dir_inode, logical_blk, true);
     if (phys_blk == 0)
-        return -1; // 空间不足
+        return -1; //空间不足
 
     struct buf_head *bh = sb_bread(phys_blk);
     if (!bh)
         return -1;
 
-    // 写入新 entry
+    //写入新entry
     struct sfs_entry *entry = (struct sfs_entry *)(bh->data + offset_in_blk);
     entry->ino = ino;
-    // 安全的字符串拷贝
+    //拷贝文件名
     int i = 0;
     for (; i < SFS_MAX_FILENAME_LEN && name[i]; i++)
     {
@@ -483,68 +419,59 @@ static int sfs_dir_link(struct sfs_inode *dir_inode, const char *name, uint32_t 
     mark_buffer_dirty(bh);
     brelse(bh);
 
-    // 更新目录大小
+    //更新目录大小
     dir_inode->size += sizeof(struct sfs_entry);
     return 0;
 }
 
-// 将内存中的 inode 写回磁盘
-// 注意：参数 inode 通常是指向 buffer cache 内部数据的指针
-// 所以调用 mark_buffer_dirty(bh) 即可，这里我们假设上层持有 bh
-// 如果上层只持有 inode 的值拷贝，我们需要重新 bread
+//将内存中的inode写回
 static void sfs_update_inode(uint32_t ino, struct sfs_inode *inode_data)
 {
     struct buf_head *bh = sb_bread(ino);
     if (!bh)
         return;
 
-    // Inode 位于块的起始位置 (实验简化设定)
+    //inode在块的起始位置
     sfs_memcpy(bh->data, inode_data, sizeof(struct sfs_inode));
     mark_buffer_dirty(bh);
     brelse(bh);
 }
 
-/**
- * 在父目录中创建一个新文件/目录
- * @parent_ino: 父目录 Inode 编号
- * @name: 文件名
- * @type: SFS_FILE 或 SFS_DIRECTORY
- * * Return: 新建的 Inode 编号，失败返回 0
- */
+//创建文件/目录
 static uint32_t sfs_create_inode(uint32_t parent_ino, const char *name, uint16_t type)
 {
-    // 1. 分配一个新的块作为 Inode 块
+    //分配一个块作为inode
     uint32_t new_ino = sfs_alloc_block();
     if (new_ino == 0)
         return 0;
 
-    // 2. 初始化新 Inode
-    // 读取新块的 buffer (内容已被 allocator 清零)
+    //初始化新inode
+    //读新块的buffer
     struct buf_head *bh = sb_bread(new_ino);
     struct sfs_inode *new_inode = (struct sfs_inode *)bh->data;
 
     new_inode->size = 0;
     new_inode->type = type;
     new_inode->links = 1;
-    new_inode->blocks = 1;    // 自身占一个块
-    new_inode->direct[0] = 0; // 还没有数据块 (对于文件)
+    new_inode->blocks = 1;    //自己
+    new_inode->direct[0] = 0; //还没有数据块
     new_inode->indirect = 0;
 
-    // 如果是目录，需要分配一个数据块来存放 "." and ".."
+    //如果是目录，需要分配一个数据块来存放.和..
     if (type == SFS_DIRECTORY)
     {
         uint32_t data_blk = sfs_alloc_block();
         if (data_blk == 0)
         {
             brelse(bh);
-            // 回滚：释放刚才分配的 inode 块
+            //释放刚才分配的inode块
             sfs_free_block(new_ino);
             return 0;
         }
         new_inode->direct[0] = data_blk;
-        new_inode->size = 2 * sizeof(struct sfs_entry); // 初始大小
+        new_inode->size = 2 * sizeof(struct sfs_entry);//初始大小
 
-        // 初始化目录项 "." 和 ".."
+        //初始化.和..
         struct buf_head *dbh = sb_bread(data_blk);
         struct sfs_entry *entries = (struct sfs_entry *)dbh->data;
 
@@ -561,26 +488,27 @@ static uint32_t sfs_create_inode(uint32_t parent_ino, const char *name, uint16_t
     mark_buffer_dirty(bh);
     brelse(bh);
 
-    // 3. 将新文件链接到父目录
+    //将新文件链接到父目录
     struct buf_head *parent_bh = sb_bread(parent_ino);
     if (!parent_bh)
-        return 0; // Should handle rollback
+        return 0;
     struct sfs_inode *parent_inode = (struct sfs_inode *)parent_bh->data;
 
     if (sfs_dir_link(parent_inode, name, new_ino) != 0)
     {
-        // Link 失败，需要清理资源 (略简化)
+        //Link失败
         brelse(parent_bh);
         return 0;
     }
 
-    // 更新父目录 size 等信息
+    //更新父目录
     mark_buffer_dirty(parent_bh);
     brelse(parent_bh);
 
     return new_ino;
 }
 
+//打开文件
 int sfs_open(const char *path, uint32_t flags)
 {
     if (!is_sfs_mounted)
@@ -589,7 +517,6 @@ int sfs_open(const char *path, uint32_t flags)
             return -1;
     }
 
-    // 允许 path 为地址 0 (test5 情况)，只要内容合法
     if (path[0] != '/')
         return -1;
 
@@ -603,9 +530,8 @@ int sfs_open(const char *path, uint32_t flags)
     {
         int j = 0;
         while (path[i] && path[i] != '/' && j < SFS_MAX_FILENAME_LEN)
-        {
             name[j++] = path[i++];
-        }
+
         name[j] = '\0';
         while (path[i] == '/')
             i++;
@@ -621,27 +547,20 @@ int sfs_open(const char *path, uint32_t flags)
 
         uint32_t next_ino = 0;
 
-        // 处理根目录的 ..
+        //特判根目录的..
         if (current_ino == 1 && strcmp(name, "..") == 0)
-        {
             next_ino = 1;
-        }
         else
-        {
             next_ino = sfs_lookup(inode, name);
-        }
 
-        // 关键修改：在进行创建操作前，先释放当前目录的 buffer 引用
-        // 这样 sfs_create_inode 内部获取 buffer 时是独占的（逻辑上），
-        // 且避免了嵌套引用可能带来的复杂性。
         brelse(bh);
 
         if (next_ino == 0)
         {
             if (flags & SFS_FLAG_WRITE)
             {
-                // 判断是否是路径最后一段
-                // 如果 path[i] != '\0'，说明是中间目录，需要创建目录
+                //判断是否是路径最后一段
+                //path[i] != '\0'说明是中间目录，需要创建目录
                 uint16_t type = (path[i] != '\0') ? SFS_DIRECTORY : SFS_FILE;
 
                 next_ino = sfs_create_inode(current_ino, name, type);
@@ -649,25 +568,20 @@ int sfs_open(const char *path, uint32_t flags)
                     return -1;
             }
             else
-            {
                 return -1;
-            }
         }
 
         parent_ino = current_ino;
         current_ino = next_ino;
-        // bh 已经在上面释放了，这里不需要再释放
     }
 
     int fd = -1;
     for (int k = 0; k < 16; k++)
-    {
         if (current->fs.fds[k] == NULL)
         {
             fd = k;
             break;
         }
-    }
     if (fd == -1)
         return -1;
 
@@ -677,7 +591,7 @@ int sfs_open(const char *path, uint32_t flags)
     f->flags = flags;
     f->off = 0;
 
-    // 读取 inode 获取 size
+    // 读取inode获取size
     struct buf_head *bh = sb_bread(current_ino);
     struct sfs_inode *inode = (struct sfs_inode *)bh->data;
     f->size = inode->size;
@@ -694,14 +608,14 @@ int sfs_close(int fd)
 
     struct file *f = current->fs.fds[fd];
 
-    // 我们使用了 Buffer Cache，数据会在 brelse 或者后续被置换时写回
-    // 这里不需要显式写回 inode，因为每次 write 操作都更新了 inode 并标记 dirty
+    //这里不需要显式写回inode，因为每次write操作都更新了inode并标记dirty
 
     sfs_free(f);
     current->fs.fds[fd] = NULL;
     return 0;
 }
 
+//移动文件指针
 int sfs_seek(int fd, int32_t off, int fromwhere)
 {
     if (fd < 0 || fd >= 16 || current->fs.fds[fd] == NULL)
@@ -709,9 +623,6 @@ int sfs_seek(int fd, int32_t off, int fromwhere)
     struct file *f = current->fs.fds[fd];
 
     int32_t new_pos = f->off;
-
-    // 为了获取准确的 size，最好读一下 inode，但为了性能暂时用 f->size
-    // 如果需要最强一致性，这里应该 sb_bread 读取 inode->size
 
     switch (fromwhere)
     {
@@ -729,7 +640,7 @@ int sfs_seek(int fd, int32_t off, int fromwhere)
     }
 
     if (new_pos < 0 || new_pos > f->size)
-        return -1; // 简单起见，不允许 seek 超过 EOF
+        return -1;
 
     f->off = new_pos;
     return 0;
@@ -741,20 +652,17 @@ int sfs_read(int fd, char *buf, uint32_t len)
         return -1;
     struct file *f = current->fs.fds[fd];
 
-    // 获取 inode
     struct buf_head *ibh = sb_bread(f->ino);
     struct sfs_inode *inode = (struct sfs_inode *)ibh->data;
 
-    // 检查越界
+    //越界
     if (f->off >= inode->size)
     {
         brelse(ibh);
         return 0;
     }
     if (f->off + len > inode->size)
-    {
         len = inode->size - f->off;
-    }
 
     uint32_t read_bytes = 0;
     uint32_t current_off = f->off;
@@ -767,21 +675,16 @@ int sfs_read(int fd, char *buf, uint32_t len)
         if (bytes_to_read > len)
             bytes_to_read = len;
 
-        // 获取物理块号 (read 不 alloc)
         uint32_t phys_blk = sfs_bmap(inode, logical_blk, false);
 
         if (phys_blk != 0)
         {
             struct buf_head *dbh = sb_bread(phys_blk);
-            // 拷贝数据到用户 buffer
             sfs_memcpy(buf + read_bytes, dbh->data + offset_in_blk, bytes_to_read);
             brelse(dbh);
         }
         else
-        {
-            // 稀疏文件/空洞，填 0
             sfs_memset(buf + read_bytes, 0, bytes_to_read);
-        }
 
         read_bytes += bytes_to_read;
         current_off += bytes_to_read;
@@ -816,16 +719,11 @@ int sfs_write(int fd, char *buf, uint32_t len)
         if (bytes_to_write > len)
             bytes_to_write = len;
 
-        // 获取物理块号 (alloc = true)
         uint32_t phys_blk = sfs_bmap(inode, logical_blk, true);
         if (phys_blk == 0)
-        {
-            // 磁盘满
-            break;
-        }
+            break;//磁盘满了
 
         struct buf_head *dbh = sb_bread(phys_blk);
-        // 从用户 buffer 拷贝到缓存
         sfs_memcpy(dbh->data + offset_in_blk, buf + written_bytes, bytes_to_write);
         mark_buffer_dirty(dbh);
         brelse(dbh);
@@ -835,24 +733,17 @@ int sfs_write(int fd, char *buf, uint32_t len)
         len -= bytes_to_write;
     }
 
-    // 更新 offset
     f->off = current_off;
 
-    // 如果文件变大，更新 inode size
+    //如果文件变大了，要更新inode size
     if (f->off > inode->size)
     {
         inode->size = f->off;
-        mark_buffer_dirty(ibh); // inode 变脏了
-    }
-    else
-    {
-        // 如果我们修改了 bmap (分配了新块)，inode 里的 blocks/direct/indirect 也会变
-        // sfs_bmap 是直接修改内存中 inode 指针指向的数据，所以 ibh 其实已经脏了
-        // 我们需要确保 mark_buffer_dirty
         mark_buffer_dirty(ibh);
     }
+    else
+        mark_buffer_dirty(ibh);
 
-    // 更新 file 结构体中的 cache size
     f->size = inode->size;
 
     brelse(ibh);
@@ -864,7 +755,7 @@ int sfs_get_files(const char *path, char *files[])
     if (!is_sfs_mounted)
         sfs_init();
 
-    // 1. 打开目录
+    //打开目录
     int fd = sfs_open(path, SFS_FLAG_READ);
     if (fd < 0)
         return -1;
@@ -889,7 +780,7 @@ int sfs_get_files(const char *path, char *files[])
 
     while (processed < entry_count)
     {
-        // 读取目录数据块
+        //读目录数据块
         uint32_t phys_blk = sfs_bmap(inode, logical_blk++, false);
         if (phys_blk == 0)
             break;
@@ -899,7 +790,7 @@ int sfs_get_files(const char *path, char *files[])
 
         for (int i = 0; i < entries_per_block && processed < entry_count; i++)
         {
-            // 过滤掉 inode 为 0 的空项（如果存在）
+            //过滤掉inode为0的空项（如果存在）
             if (entries[i].ino != 0)
             {
                 sfs_memcpy(files[count], entries[i].filename, SFS_MAX_FILENAME_LEN + 1);
