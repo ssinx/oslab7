@@ -5,7 +5,7 @@
 #include "virtio.h"
 
 int start_kernel() {
-  puts("ZJU OSLAB 7 学号 姓名\n");
+  puts("ZJU OSLAB 7 3230104468 黄昭睿 3230104601 张俊奕\n");
   
   slub_init();
   task_init();
